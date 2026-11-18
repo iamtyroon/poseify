@@ -5,6 +5,9 @@ import type { CatalogEntry } from "./models/ModelCatalog";
 import { SHORTCUT_HELP } from "./prefs/Shortcuts";
 import { isHidden, isLocked } from "./scene/ObjectState";
 import { PASS_LABELS, type RenderPass } from "./export/RenderPasses";
+import { handPoseThumbnail } from "./pose/HandPoseThumbnail";
+import { poseThumbnailer } from "./pose/PoseThumbnail";
+import { loadClip } from "./anim/ClipPlayer";
 
 const {
   mount,
@@ -21,6 +24,7 @@ const {
   init,
   attachModel,
   setActive,
+  activateModelWithPose,
   selectBone,
   selectObject,
   setObjectGizmoMode,
@@ -100,7 +104,6 @@ const {
   loadThumbnails,
   loadingId,
   frameScene,
-  modelDebug,
   fov,
   light,
   grid,
@@ -137,9 +140,6 @@ const {
   poseTagFilter,
   appliedPoseId,
   poseError,
-  poseLibraryError,
-  generatedPoseCount,
-  loadGeneratedLibrary,
   allPremadeScenes,
   loadGeneratedSceneLibrary,
   sceneLibraryError,
@@ -195,7 +195,6 @@ const {
   isFavorite,
   toggleFavorite,
   showFavoritesOnly,
-  toggleFavoritesFilter,
   settingsOpen,
   openSettings,
   setPref,
@@ -212,7 +211,6 @@ onMounted(() => {
   loadThumbnails();
   void loadClips();
   refreshSavedScenes();
-  void loadGeneratedLibrary();
   void loadGeneratedSceneLibrary();
   void loadVendorPoseLibrary();
   void loadVendorSceneLibrary();
@@ -232,10 +230,6 @@ async function addModel(config: CatalogEntry): Promise<void> {
     const posed = await attachModel(config);
     setActive(posed.config.id);
     frameScene();
-    // Every section in the right panel is scoped to an active model, so reveal
-    // it now rather than leaving the artist with an empty canvas and a hidden
-    // library to hunt for.
-    showRightPanel.value = true;
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -245,6 +239,16 @@ async function addModel(config: CatalogEntry): Promise<void> {
 function captureViewport(): void {
   const shot = takeScreenshot();
   if (shot) download("poseify-viewport.png", shot);
+}
+
+const imageFileInput = ref<HTMLInputElement | null>(null);
+function chooseImage(): void {
+  imageFileInput.value?.click();
+}
+
+function saveQuickCameraPreset(): void {
+  const next = prefs.value.cameraPresets.length + 1;
+  saveCameraPreset(`Camera ${next}`);
 }
 const groups = computed(() => {
   const map = new Map<string, CatalogEntry[]>();
@@ -295,8 +299,11 @@ type OverlayName =
   | "models"
   | "props"
   | "poses"
+  | "hands"
+  | "animations"
   | "scenes"
   | "export"
+  | "camera"
   | "objects"
   | "groups"
   | "anchors";
@@ -307,8 +314,11 @@ const OVERLAY_TITLES: Record<OverlayName, string> = {
   models: "Add Models",
   props: "Add Props",
   poses: "Poses",
+  hands: "Hand Poses",
+  animations: "Animations",
   scenes: "Premade Scenes",
   export: "Export",
+  camera: "Camera",
   objects: "Scene Objects",
   groups: "Joint Groups",
   anchors: "Anchors",
@@ -319,12 +329,24 @@ const overlayTitle = computed(() =>
 );
 
 function openOverlay(name: OverlayName): void {
+  showLightPanel.value = false;
   // Clicking the active rail button closes it, so the rail toggles.
   activeOverlay.value = activeOverlay.value === name ? null : name;
 }
 
 function closeOverlay(): void {
   activeOverlay.value = null;
+}
+
+function toggleLightPanel(): void {
+  showLightPanel.value = !showLightPanel.value;
+  if (showLightPanel.value) closeOverlay();
+}
+
+function openSettingsMenu(): void {
+  closeOverlay();
+  showLightPanel.value = false;
+  openSettings();
 }
 
 // Colour swatch needs a value to bind to; remember the last one chosen so the
@@ -395,17 +417,68 @@ const premadeScenes = allPremadeScenes;
 const libraryTab = ref<"poses" | "props" | "scenes">("poses");
 const librarySearch = ref("");
 
-// The overlay shell hides the two original side panels, but several sections
-// were never ported into an overlay pane: the reference library (5,170 poses,
-// 1,331 props, 5,543 scenes), hand poses, joint groups and anchors. They stay
-// in the markup, so the panel is toggled back into view rather than duplicating
-// all of it. Opening a model reveals the panel, because every one of those
-// sections is scoped to `activeModelId` and would otherwise show empty.
-const showRightPanel = ref(false);
+// Model tools appear only while a model is selected in the viewport.
+const hasSelectedModel = computed(() =>
+  models.value.some(
+    (model) => model.instanceId === selectedObjectId.value && model.config.id === activeModelId.value,
+  ),
+);
+const showLightPanel = ref(false);
+const lightControlsLocked = ref(false);
+const lightControlMode = ref<"move" | "rotate" | "scale">("rotate");
 
-function toggleRightPanel(): void {
-  showRightPanel.value = !showRightPanel.value;
+function switchSelectedModel(direction: -1 | 1): void {
+  const index = models.value.findIndex((model) => model.instanceId === selectedObjectId.value);
+  if (index < 0 || models.value.length < 2) return;
+  const next = models.value[(index + direction + models.value.length) % models.value.length];
+  activateModelWithPose(next.config.id);
+  selectObject(next.instanceId);
 }
+
+const handPoseThumbs = ref<Record<string, string>>({});
+watch([activeOverlay, visibleHandPoses], async () => {
+  if (activeOverlay.value !== "hands") return;
+  const previewModel = catalog.find((model) => model.id === "mannequin_male") ?? catalog[0];
+  if (!previewModel) return;
+  for (const pose of visibleHandPoses.value) {
+    if (handPoseThumbs.value[pose.id]) continue;
+    const image = await handPoseThumbnail(previewModel, pose);
+    if (image) handPoseThumbs.value = { ...handPoseThumbs.value, [pose.id]: image };
+  }
+});
+
+const animationThumbs = ref<Record<string, string>>({});
+const animationPage = ref(0);
+const animationPageSize = 24;
+const pagedAnimations = computed(() =>
+  visibleClips.value.slice(
+    animationPage.value * animationPageSize,
+    (animationPage.value + 1) * animationPageSize,
+  ),
+);
+const animationPageCount = computed(() =>
+  Math.max(1, Math.ceil(visibleClips.value.length / animationPageSize)),
+);
+watch(clipSearch, () => {
+  animationPage.value = 0;
+});
+watch([activeOverlay, pagedAnimations], async () => {
+  if (activeOverlay.value !== "animations") return;
+  for (const clip of pagedAnimations.value) {
+    if (animationThumbs.value[clip.id]) continue;
+    const loaded = await loadClip(clip.id);
+    const frame = loaded?.frames[Math.floor((loaded.frames.length - 1) / 2)];
+    if (!frame) continue;
+    const image = await poseThumbnailer().thumbnail({
+      id: `animation-preview:${clip.id}`,
+      name: clip.name,
+      tags: clip.tags,
+      bones: frame.rotations,
+      source: "clip",
+    });
+    if (image) animationThumbs.value = { ...animationThumbs.value, [clip.id]: image };
+  }
+});
 
 const filteredVendorPoses = computed(() => {
   const needle = librarySearch.value.trim().toLowerCase();
@@ -436,11 +509,14 @@ watch(
   <div class="app">
     <div ref="mount" class="viewport"></div>
 
-    <!--
-      Icon rails over the canvas, matching PoseMy.Art's layout: no permanent
-      side panels, every tool is a round button that opens an overlay. The
-      canvas stays clear, which is the whole point of the redesign.
-    -->
+    <input
+      ref="imageFileInput"
+      type="file"
+      accept="image/*"
+      hidden
+      @change="onImageFile"
+    />
+
     <nav class="rail rail-top-left" aria-label="Add to scene">
       <button
         type="button"
@@ -449,7 +525,7 @@ watch(
         title="Add Models"
         @click="openOverlay('models')"
       >
-        <span aria-hidden="true">&#9635;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5"/><path d="M12 8v6m-8-4 8 2 8-2M8 21v-5l4-2 4 2v5"/></svg>
       </button>
       <button
         type="button"
@@ -458,17 +534,7 @@ watch(
         title="Add Props"
         @click="openOverlay('props')"
       >
-        <span aria-hidden="true">&#9638;</span>
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
-        aria-label="Poses"
-        title="Poses"
-        :disabled="!activeModelId"
-        @click="openOverlay('poses')"
-      >
-        <span aria-hidden="true">&#9655;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Z"/><path d="m3 7 9 5 9-5M12 12v10"/></svg>
       </button>
       <button
         type="button"
@@ -477,7 +543,34 @@ watch(
         title="Premade Scenes"
         @click="openOverlay('scenes')"
       >
-        <span aria-hidden="true">&#9635;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/></svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Add Image"
+        title="Add Image"
+        @click="chooseImage()"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Camera"
+        title="Camera controls and saved views"
+        @click="openOverlay('camera')"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h3l2-3h6l2 3h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="4"/></svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Save Camera View"
+        title="Save current camera view"
+        @click="saveQuickCameraPreset()"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 7h3l2-3h6l2 3h3a2 2 0 0 1 2 2v5"/><path d="M3 7v11a2 2 0 0 0 2 2h9"/><circle cx="11" cy="13" r="4"/><path d="M19 16v6m-3-3h6"/></svg>
       </button>
       <button
         type="button"
@@ -486,37 +579,32 @@ watch(
         title="Export"
         @click="openOverlay('export')"
       >
-        <span aria-hidden="true">&#8681;</span>
-      </button>
-      <!--
-        Groups and anchors are first-class menus here, not a section buried in
-        the right panel. PoseMy.Art gives both their own top-level menu button,
-        and the v2 audit found the working implementations were unreachable
-        there: an artist would not find a feature they never see.
-      -->
-      <button
-        type="button"
-        class="icon-btn"
-        aria-label="Joint Groups"
-        title="Group a chain of joints so it can be posed or reset as a unit"
-        :disabled="!activeModelId"
-        @click="openOverlay('groups')"
-      >
-        <span aria-hidden="true">&#9783;</span>
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
-        aria-label="Anchors"
-        title="Pin a joint to another joint or a prop"
-        :disabled="!activeModelId"
-        @click="openOverlay('anchors')"
-      >
-        <span aria-hidden="true">&#9873;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 19v2h16v-2"/></svg>
       </button>
     </nav>
 
     <nav class="rail rail-top-right" aria-label="Scene and settings">
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Save and load"
+        title="Save &amp; Load"
+        @click="openOverlay('scenes')"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 3h13l4 4v14H3V3h1Z"/><path d="M7 3v6h10V3M7 21v-8h10v8"/></svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        aria-label="Settings"
+        title="Settings and keyboard shortcuts (Ctrl+,)"
+        @click="openSettingsMenu()"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1a1.7 1.7 0 1 1-2.4 2.4l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.4a1.7 1.7 0 1 1-3.4 0v-.2a1.7 1.7 0 0 0-2.9-1.2l-.1.1a1.7 1.7 0 1 1-2.4-2.4l.1-.1a1.7 1.7 0 0 0-1.2-2.9h-.4a1.7 1.7 0 1 1 0-3.4h.2a1.7 1.7 0 0 0 1.2-2.9l-.1-.1a1.7 1.7 0 1 1 2.4-2.4l.1.1a1.7 1.7 0 0 0 2.9-1.2v-.4a1.7 1.7 0 1 1 3.4 0v.2a1.7 1.7 0 0 0 2.9 1.2l.1-.1a1.7 1.7 0 1 1 2.4 2.4l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.4a1.7 1.7 0 1 1 0 3.4h-.2a1.7 1.7 0 0 0-1.2 2.9Z"/></svg>
+      </button>
+    </nav>
+
+    <nav class="rail rail-bottom-left" aria-label="Scene controls">
       <button
         type="button"
         class="icon-btn"
@@ -525,7 +613,7 @@ watch(
         :disabled="!canUndo"
         @click="undo()"
       >
-        <span aria-hidden="true">&#8630;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h9a7 7 0 0 1 7 7v3"/></svg>
       </button>
       <button
         type="button"
@@ -535,222 +623,61 @@ watch(
         :disabled="!canRedo"
         @click="redo()"
       >
-        <span aria-hidden="true">&#8631;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9h-9a7 7 0 0 0-7 7v3"/></svg>
       </button>
       <button
         type="button"
         class="icon-btn"
-        aria-label="Save and load"
-        title="Save &amp; Load"
-        @click="openOverlay('scenes')"
+        :class="{ on: showLightPanel }"
+        :aria-pressed="showLightPanel"
+        aria-label="Directional Light"
+        title="Directional Light controls"
+        @click="toggleLightPanel()"
       >
-        <span aria-hidden="true">&#128190;</span>
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
-        :class="{ on: showFavoritesOnly }"
-        :aria-pressed="showFavoritesOnly"
-        aria-label="Favourites"
-        title="Show only favourited models (F)"
-        @click="toggleFavoritesFilter()"
-      >
-        <span aria-hidden="true">&#9829;</span>
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
-        aria-label="Settings"
-        title="Settings and keyboard shortcuts (Ctrl+,)"
-        @click="openSettings()"
-      >
-        <span aria-hidden="true">&#9881;</span>
-      </button>
-      <!--
-        Joint handles. PoseMy.Art exposes the same pair of booleans bottom-left
-        (model/joint gizmo, light gizmo); this is the joint one, so an artist
-        can see the joints they are about to pose or attach to.
-      -->
-      <button
-        type="button"
-        class="icon-btn"
-        :class="{ on: jointHandlesVisible || attachModeActive }"
-        :aria-pressed="jointHandlesVisible || attachModeActive"
-        aria-label="Joint handles"
-        title="Show a handle on every joint (also shown while attaching)"
-        :disabled="!activeModelId"
-        @click="setJointHandlesVisible(!jointHandlesVisible)"
-      >
-        <span aria-hidden="true">&#9673;</span>
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
-        :class="{ on: showRightPanel }"
-        aria-label="Library and tools panel"
-        title="Reference library, hand poses, joint groups and anchors"
-        @click="toggleRightPanel()"
-      >
-        <span aria-hidden="true">&#9776;</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
       </button>
     </nav>
 
-    <!--
-      Context toolbar. Only appears when a model is selected, and mirrors
-      PoseMy.Art's order so muscle memory transfers: transform first, then
-      pose editing, then object-level commands.
-    -->
-    <div
-      v-if="activeModelId"
-      class="context-bar"
-      :class="{ 'with-panel': showRightPanel }"
-      role="toolbar"
-      aria-label="Object and pose tools"
-    >
-      <div class="segmented" role="group" aria-label="Transform mode">
-        <button
-          type="button"
-          :class="{ on: objectGizmoMode === 'translate' }"
-          title="Move (G)"
-          aria-label="Move"
-          @click="setObjectGizmoMode('translate')"
-        >
-          Move
-        </button>
-        <button
-          type="button"
-          :class="{ on: objectGizmoMode === 'rotate' }"
-          title="Rotate (Shift+R)"
-          aria-label="Rotate"
-          @click="setObjectGizmoMode('rotate')"
-        >
-          Rotate
-        </button>
-        <button
-          type="button"
-          :class="{ on: objectGizmoMode === 'scale' }"
-          title="Scale (S)"
-          aria-label="Scale"
-          @click="setObjectGizmoMode('scale')"
-        >
-          Scale
-        </button>
+    <section v-if="showLightPanel" class="light-panel" aria-label="Directional Light">
+      <header class="drawer-head">
+        <strong>Directional Light</strong>
+        <button type="button" class="icon-btn close" aria-label="Close light controls" @click="showLightPanel = false">&times;</button>
+      </header>
+      <div class="segmented light-modes" role="group" aria-label="Light transform mode">
+        <button :class="{ on: lightControlMode === 'move' }" @click="lightControlMode = 'move'">Move</button>
+        <button :class="{ on: lightControlMode === 'rotate' }" @click="lightControlMode = 'rotate'">Rotate</button>
+        <button :class="{ on: lightControlMode === 'scale' }" @click="lightControlMode = 'scale'">Scale</button>
       </div>
-
-      <span class="context-divider" aria-hidden="true"></span>
-
-      <button
-        type="button"
-        class="tool-btn"
-        title="Switch Pose Sides"
-        @click="switchPoseSides()"
-      >
-        Switch Sides
-      </button>
-      <button
-        type="button"
-        class="tool-btn"
-        title="Mirror arms only"
-        @click="mirrorArmLimb()"
-      >
-        Mirror Arms
-      </button>
-      <button
-        type="button"
-        class="tool-btn"
-        title="Mirror legs only"
-        @click="mirrorLegLimb()"
-      >
-        Mirror Legs
-      </button>
-      <button
-        type="button"
-        class="tool-btn"
-        title="Reset the selected joint"
-        @click="resetSelectedJoint()"
-      >
-        Reset Joint
-      </button>
-
-      <span class="context-divider" aria-hidden="true"></span>
-
-      <button
-        type="button"
-        class="tool-btn"
-        title="Duplicate (Shift+D)"
-        @click="duplicateSelectedObject()"
-      >
-        Duplicate
-      </button>
-      <button
-        type="button"
-        class="tool-btn"
-        title="Hide / show (Shift+H)"
-        @click="toggleObjectHidden()"
-      >
-        Hide
-      </button>
-      <button
-        type="button"
-        class="tool-btn"
-        title="Lock / unlock (L)"
-        @click="toggleObjectLocked()"
-      >
-        Lock
-      </button>
-
-      <!--
-        Attach to Joint, mirroring PoseMy.Art. Only meaningful for a prop, and
-        only with a figure loaded to attach it to, so it stays hidden otherwise
-        rather than sitting there greyed out explaining nothing.
-      -->
-      <button
-        v-if="attachableSelectedProp"
-        type="button"
-        class="tool-btn"
-        :class="{ on: attachModeActive }"
-        :title="
-          attachModeActive
-            ? 'Click a highlighted joint, or press Escape to cancel'
-            : attachableSelectedProp.attach
-              ? 'Detach from the joint'
-              : 'Attach to a joint'
-        "
-        @click="toggleAttachToJoint(attachableSelectedProp.id)"
-      >
-        {{ attachModeActive ? "Pick a joint" : attachableSelectedProp.attach ? "Detach" : "Attach" }}
-      </button>
-
-      <label class="tool-swatch" title="Object colour">
-        <span class="visually-hidden">Object colour</span>
-        <input
-          type="color"
-          :value="objectColor"
-          @input="setSelectedObjectColor(($event.target as HTMLInputElement).value)"
-        />
+      <label v-if="lightControlMode === 'move'" class="field">
+        <span>Position <b>{{ light.distance.toFixed(1) }} m</b></span>
+        <input type="range" min="3" max="15" step="0.1" :disabled="lightControlsLocked" :value="light.distance" @input="setLight({ distance: Number(($event.target as HTMLInputElement).value) })" />
       </label>
-      <button
-        type="button"
-        class="tool-btn danger"
-        title="Delete (Del)"
-        @click="deleteSelectedObject()"
-      >
-        Delete
+      <template v-else-if="lightControlMode === 'rotate'">
+        <label class="field">
+          <span>Azimuth <b>{{ Math.round(light.azimuth) }}&deg;</b></span>
+          <input type="range" min="0" max="360" step="1" :disabled="lightControlsLocked" :value="light.azimuth" @input="setLight({ azimuth: Number(($event.target as HTMLInputElement).value) })" />
+        </label>
+        <label class="field">
+          <span>Elevation <b>{{ Math.round(light.elevation) }}&deg;</b></span>
+          <input type="range" min="1" max="179" step="1" :disabled="lightControlsLocked" :value="light.elevation" @input="setLight({ elevation: Number(($event.target as HTMLInputElement).value) })" />
+        </label>
+      </template>
+      <label v-else class="field">
+        <span>Intensity <b>{{ light.intensity.toFixed(1) }}</b></span>
+        <input type="range" min="0" max="6" step="0.1" :disabled="lightControlsLocked" :value="light.intensity" @input="setLight({ intensity: Number(($event.target as HTMLInputElement).value) })" />
+      </label>
+      <label class="check">
+        <input type="checkbox" :checked="lightGizmoVisible" @change="setLightGizmo(($event.target as HTMLInputElement).checked)" />
+        <span>Show light gizmo</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" :checked="light.castShadows" :disabled="lightControlsLocked" @change="setLight({ castShadows: ($event.target as HTMLInputElement).checked })" />
+        <span>Shadows</span>
+      </label>
+      <button type="button" class="chip wide" :class="{ on: lightControlsLocked }" :aria-pressed="lightControlsLocked" @click="lightControlsLocked = !lightControlsLocked">
+        {{ lightControlsLocked ? "Unlock light" : "Lock light" }}
       </button>
-    </div>
-
-    <p v-if="status" class="status-pill" aria-live="polite">{{ status }}</p>
-
-    <!-- TEMPORARY diagnostic for the invisible-model bug. Remove with
-         modelDebug() in usePosing.ts once the cause is fixed. -->
-    <p
-      v-if="activeModelId"
-      class="status-pill attach-hint"
-      aria-live="off"
-      data-debug="model"
-    >
-      {{ modelDebug() }}
-    </p>
+    </section>
 
     <!--
       Attach mode feedback. An artist who presses Attach and sees nothing
@@ -775,6 +702,7 @@ watch(
     <section
       v-if="activeOverlay"
       class="overlay"
+      :class="{ 'hand-overlay': activeOverlay === 'hands' }"
       role="dialog"
       :aria-label="overlayTitle"
     >
@@ -791,6 +719,98 @@ watch(
         </button>
       </header>
       <div class="overlay-body">
+        <div v-if="activeOverlay === 'camera'" class="overlay-pane">
+          <label class="field">
+            <span>Field of view <b>{{ Math.round(fov) }}&deg;</b></span>
+            <input type="range" min="10" max="110" step="1" :value="fov" @input="setFov(Number(($event.target as HTMLInputElement).value))" />
+          </label>
+          <div class="chip-grid">
+            <button type="button" class="chip" @click="frameScene">Frame scene</button>
+            <button type="button" class="chip" @click="toggleCameraLock">{{ cameraLocked ? "Unlock camera" : "Lock camera" }}</button>
+            <button type="button" class="chip" @click="resetCamera">Reset camera</button>
+            <button type="button" class="chip" @click="captureViewport">Screenshot</button>
+          </div>
+          <label class="field">
+            <span>Save current view</span>
+            <input v-model="cameraPresetName" type="text" placeholder="Preset name" />
+          </label>
+          <button type="button" class="chip" :disabled="!cameraPresetName.trim()" @click="saveCameraPreset()">Save view</button>
+          <p v-if="cameraError" class="hint warn">{{ cameraError }}</p>
+          <ul v-if="prefs.cameraPresets.length" class="list">
+            <li v-for="preset in prefs.cameraPresets" :key="preset.name">
+              <button type="button" @click="applyCameraPreset(preset)">{{ preset.name }}</button>
+              <button type="button" class="danger" :aria-label="`Delete preset ${preset.name}`" @click="deleteCameraPreset(preset.name)">&times;</button>
+            </li>
+          </ul>
+        </div>
+        <div v-else-if="activeOverlay === 'hands'" class="overlay-pane hand-pose-browser">
+          <div class="hand-side-tabs" role="group" aria-label="Hand side">
+            <button type="button" :class="{ on: handSide === 'Right' }" @click="setHandSide('Right')">Right hand</button>
+            <button type="button" :class="{ on: handSide === 'Left' }" @click="setHandSide('Left')">Left hand</button>
+          </div>
+          <div class="overlay-controls">
+            <label class="field grow">
+              <span>Find hand poses</span>
+              <input v-model="handPoseSearch" type="search" placeholder="fist, point, open palm" />
+            </label>
+            <div class="row">
+              <button type="button" class="chip" title="Copy pose and hands" @click="copyHandPose()">Copy</button>
+              <button type="button" class="chip" title="Paste hands only" @click="pasteHandOnly()">Paste</button>
+              <button type="button" class="chip" title="Reset hands" @click="resetHands()">Reset</button>
+            </div>
+          </div>
+          <p v-if="handPoseStatus" class="hint">{{ handPoseStatus }}</p>
+          <p v-if="handPoseError" class="hint warn">{{ handPoseError }}</p>
+          <div class="pose-grid hand-pose-grid">
+            <button
+              v-for="pose in visibleHandPoses"
+              :key="pose.id"
+              type="button"
+              class="pose-tile hand-pose-tile"
+              :title="`${pose.name} — ${pose.tags.join(', ')}`"
+              @click="applyHandPose(pose)"
+            >
+              <img v-if="handPoseThumbs[pose.id]" :src="handPoseThumbs[pose.id]" :alt="pose.name" />
+              <span v-else class="hand-preview-loading" aria-hidden="true"></span>
+              <span class="pose-name">{{ pose.name }}</span>
+            </button>
+          </div>
+        </div>
+        <div v-else-if="activeOverlay === 'animations'" class="overlay-pane animation-browser">
+          <label class="field">
+            <span>Find animations</span>
+            <input v-model="clipSearch" type="search" placeholder="walk, run, idle" />
+          </label>
+          <p v-if="clipError && clipSummaries.length" class="hint warn">{{ clipError }}</p>
+          <p v-if="clipSummaries.length === 0" class="animation-empty">Animations will appear here when you add them.</p>
+          <div v-else class="pose-grid animation-grid">
+            <button
+              v-for="clip in pagedAnimations"
+              :key="clip.id"
+              type="button"
+              class="pose-tile animation-tile"
+              :class="{ on: clip.id === activeClipId }"
+              :title="`${clip.name} — ${clip.durationSeconds.toFixed(1)} seconds`"
+              @click="selectClip(clip.id)"
+            >
+              <img v-if="animationThumbs[clip.id]" :src="animationThumbs[clip.id]" :alt="`${clip.name} preview`" />
+              <span v-else class="thumb placeholder" aria-hidden="true"></span>
+              <span class="pose-name">{{ clip.name }}</span>
+              <span class="clip-meta">{{ clip.durationSeconds.toFixed(1) }}s</span>
+            </button>
+          </div>
+          <div v-if="animationPageCount > 1" class="pager">
+            <button type="button" class="chip" :disabled="animationPage === 0" @click="animationPage = Math.max(0, animationPage - 1)">Previous</button>
+            <span class="hint">Page {{ animationPage + 1 }} of {{ animationPageCount }}</span>
+            <button type="button" class="chip" :disabled="animationPage >= animationPageCount - 1" @click="animationPage = Math.min(animationPageCount - 1, animationPage + 1)">Next</button>
+          </div>
+          <div v-if="activeClipId" class="animation-transport">
+            <button type="button" class="chip" @click="togglePlayback()">{{ playing ? "Pause" : "Play" }}</button>
+            <button type="button" class="chip" @click="stopPlayback()">Stop</button>
+            <input class="scrub" type="range" min="0" :max="clipDuration" step="0.01" :value="clipTime" @input="seekClip(Number(($event.target as HTMLInputElement).value))" />
+            <span class="hint">{{ clipTime.toFixed(1) }} / {{ clipDuration.toFixed(1) }}s</span>
+          </div>
+        </div>
         <!-- Models -->
         <div v-if="activeOverlay === 'models'" class="overlay-pane">
           <div v-for="[family, items] in groups" :key="family" class="group">
@@ -1145,9 +1165,8 @@ watch(
         </div>
 
         <!--
-          Joint groups. Reached from its own rail button rather than a section
-          in the right panel: the implementation was already correct, it was
-          just never surfaced where an artist would look for it.
+          Joint groups stay in their own overlay and remain reachable from the
+          model action dock.
         -->
         <div v-else-if="activeOverlay === 'groups'" class="overlay-pane">
           <p class="hint">
@@ -1363,994 +1382,31 @@ watch(
       </section>
     </aside>
 
-    <aside v-show="showRightPanel" class="panel panel-right">
-      <section>
-        <h2>Export</h2>
-        <label class="field">
-          <span>Width</span>
-          <input
-            type="number"
-            min="256"
-            max="4096"
-            step="64"
-            :value="exportWidth"
-            @input="exportWidth = Number(($event.target as HTMLInputElement).value)"
-          />
-        </label>
-        <label class="field">
-          <span>Height</span>
-          <input
-            type="number"
-            min="256"
-            max="4096"
-            step="64"
-            :value="exportHeight"
-            @input="exportHeight = Number(($event.target as HTMLInputElement).value)"
-          />
-        </label>
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="exportTransparent"
-            @change="exportTransparent = ($event.target as HTMLInputElement).checked"
-          />
-          <span>Transparent background</span>
-        </label>
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="depthPreview"
-            @change="toggleDepthPreview()"
-          />
-          <span>Preview depth</span>
-        </label>
-        <div class="export-buttons">
-          <button
-            type="button"
-            class="chip wide"
-            :disabled="exporting || !activeModelId"
-            @click="runExport()"
-          >
-            {{ exporting ? "Rendering..." : `Export all ${RENDER_PASSES.length}` }}
-          </button>
-          <button
-            type="button"
-            class="chip wide"
-            :disabled="!activeModelId"
-            @click="
-              (() => {
-                const obj = exportObjNow();
-                if (obj) download(obj.filename, obj.text);
-              })()
-            "
-          >
-            Export OBJ
-          </button>
-          <button
-            type="button"
-            class="chip wide"
-            :disabled="!models.length && !props.length"
-            title="Export every visible model and prop as one OBJ"
-            @click="
-              (() => {
-                const obj = exportSceneObjNow();
-                if (obj) download(obj.filename, obj.text);
-              })()
-            "
-          >
-            Export scene OBJ
-          </button>
-        </div>
-        <div class="tags pass-tags">
-          <button
-            v-for="pass in RENDER_PASSES"
-            :key="pass"
-            type="button"
-            class="tag"
-            :disabled="exporting || !activeModelId"
-            :title="`Export only the ${pass} pass`"
-            @click="runExport([pass])"
-          >
-            {{ PASS_LABELS[pass] }}
-          </button>
-        </div>
-        <p class="hint">
-          {{ RENDER_PASSES.length }} passes. OpenPose comes in two forms: the
-          body-only one ControlNet expects, and the with-hands variant.
-        </p>
-      </section>
+    <nav v-if="hasSelectedModel" class="model-dock" aria-label="Selected model actions">
+      <button type="button" class="model-tool" title="Pose library" aria-label="Pose library" @click="openOverlay('poses')"><span>♟</span></button>
+      <button type="button" class="model-tool" title="Move (G)" aria-label="Move model" :class="{ on: objectGizmoMode === 'translate' }" @click="setObjectGizmoMode('translate')"><span>↖</span></button>
+      <button type="button" class="model-tool" title="Rotate (Shift+R)" aria-label="Rotate model" :class="{ on: objectGizmoMode === 'rotate' }" @click="setObjectGizmoMode('rotate')"><span>⟳</span></button>
+      <button type="button" class="model-tool" title="Scale (S)" aria-label="Scale model" :class="{ on: objectGizmoMode === 'scale' }" @click="setObjectGizmoMode('scale')"><span>⛶</span></button>
+      <button type="button" class="model-tool" title="Switch to previous model, keeping pose" aria-label="Previous model" @click="switchSelectedModel(-1)"><span>⇤</span></button>
+      <button type="button" class="model-tool" title="Switch to next model, keeping pose" aria-label="Next model" @click="switchSelectedModel(1)"><span>⇥</span></button>
+      <button type="button" class="model-tool" title="Copy pose" aria-label="Copy pose" @click="copyPose()"><span>⧉</span></button>
+      <button type="button" class="model-tool" title="Paste pose" aria-label="Paste pose" @click="pastePose()"><span>▣</span></button>
+      <button type="button" class="model-tool" title="Hand poses" aria-label="Hand poses" @click="openOverlay('hands')"><span>☷</span></button>
+      <button type="button" class="model-tool" title="Animations" aria-label="Animations" @click="openOverlay('animations')"><span>▶</span></button>
+      <button type="button" class="model-tool" title="Reset pose" aria-label="Reset pose" @click="resetPose()"><span>↺</span></button>
+      <button type="button" class="model-tool" title="Mirror arms" aria-label="Mirror arms" @click="mirrorArmLimb()"><span>⇋</span></button>
+      <button type="button" class="model-tool" title="Mirror legs" aria-label="Mirror legs" @click="mirrorLegLimb()"><span>⇅</span></button>
+      <button type="button" class="model-tool" title="Switch pose sides" aria-label="Switch pose sides" @click="switchPoseSides()"><span>⇄</span></button>
+      <button type="button" class="model-tool" title="Show or hide joint handles" aria-label="Show or hide joint handles" :class="{ on: jointHandlesVisible }" @click="setJointHandlesVisible(!jointHandlesVisible)"><span>✣</span></button>
+      <button type="button" class="model-tool" title="Joint groups" aria-label="Joint groups" @click="openOverlay('groups')"><span>♧</span></button>
+      <button type="button" class="model-tool" title="Duplicate model" aria-label="Duplicate model" @click="duplicateSelectedObject()"><span>▢+</span></button>
+      <label class="model-tool color-tool" title="Model color" aria-label="Model color"><span>●</span><input type="color" aria-label="Model color" @input="setSelectedObjectColor(($event.target as HTMLInputElement).value)" /></label>
+      <button type="button" class="model-tool" title="Show or hide model" aria-label="Show or hide model" @click="toggleObjectHidden()"><span>◉</span></button>
+      <button type="button" class="model-tool" title="Lock or unlock model" aria-label="Lock or unlock model" @click="toggleObjectLocked()"><span>▣</span></button>
+      <button type="button" class="model-tool danger" title="Delete model" aria-label="Delete model" @click="deleteSelectedObject()"><span>×</span></button>
+    </nav>
 
-      <section>
-        <h2>Camera</h2>
-        <label class="field">
-          <span>FOV <b>{{ Math.round(fov) }}&deg;</b></span>
-          <input
-            type="range"
-            min="10"
-            max="110"
-            step="1"
-            :value="fov"
-            @input="setFov(Number(($event.target as HTMLInputElement).value))"
-          />
-        </label>
-        <button type="button" class="chip wide" @click="frameScene">
-          Frame scene
-        </button>
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: cameraLocked }"
-            title="Freeze the camera so orbiting cannot move the view"
-            @click="toggleCameraLock()"
-          >
-            {{ cameraLocked ? "Unlock" : "Lock" }}
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Return to the opening camera position"
-            @click="resetCamera()"
-          >
-            Reset
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Capture the viewport exactly as it looks now"
-            @click="captureViewport()"
-          >
-            Screenshot
-          </button>
-        </div>
 
-        <h3 class="sub">Camera presets</h3>
-        <div class="row preset-row">
-          <input
-            v-model="cameraPresetName"
-            type="text"
-            placeholder="Preset name"
-            aria-label="Camera preset name"
-          />
-          <button
-            type="button"
-            class="chip"
-            :disabled="!cameraPresetName.trim()"
-            @click="saveCameraPreset()"
-          >
-            Save
-          </button>
-        </div>
-        <ul v-if="prefs.cameraPresets.length" class="list">
-          <li v-for="preset in prefs.cameraPresets" :key="preset.name">
-            <button type="button" @click="applyCameraPreset(preset)">
-              {{ preset.name }}
-            </button>
-            <button
-              type="button"
-              class="danger"
-              :aria-label="`Delete preset ${preset.name}`"
-              @click="deleteCameraPreset(preset.name)"
-            >
-              &times;
-            </button>
-          </li>
-        </ul>
-        <p v-else class="hint">
-          Park a framing here to come back to it while posing something else.
-        </p>
-        <p v-if="cameraError" class="hint warn">{{ cameraError }}</p>
-      </section>
-
-      <section>
-        <h2>Light</h2>
-        <label class="field">
-          <span>Azimuth <b>{{ Math.round(light.azimuth) }}&deg;</b></span>
-          <input
-            type="range"
-            min="0"
-            max="360"
-            step="1"
-            :value="light.azimuth"
-            @input="setLight({ azimuth: Number(($event.target as HTMLInputElement).value) })"
-          />
-        </label>
-        <label class="field">
-          <span>Elevation <b>{{ Math.round(light.elevation) }}&deg;</b></span>
-          <input
-            type="range"
-            min="1"
-            max="179"
-            step="1"
-            :value="light.elevation"
-            @input="setLight({ elevation: Number(($event.target as HTMLInputElement).value) })"
-          />
-        </label>
-        <label class="field">
-          <span>Intensity <b>{{ light.intensity.toFixed(1) }}</b></span>
-          <input
-            type="range"
-            min="0"
-            max="6"
-            step="0.1"
-            :value="light.intensity"
-            @input="setLight({ intensity: Number(($event.target as HTMLInputElement).value) })"
-          />
-        </label>
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="light.castShadows"
-            @change="setLight({ castShadows: ($event.target as HTMLInputElement).checked })"
-          />
-          <span>Shadows</span>
-        </label>
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="lightGizmoVisible"
-            @change="setLightGizmo(($event.target as HTMLInputElement).checked)"
-          />
-          <span>Show light gizmo</span>
-        </label>
-      </section>
-
-      <section>
-        <h2>Grid</h2>
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="grid.visible"
-            @change="setGrid({ visible: ($event.target as HTMLInputElement).checked })"
-          />
-          <span>Show grid</span>
-        </label>
-        <label class="field">
-          <span>Cell <b>{{ grid.cellSize.toFixed(2) }} m</b></span>
-          <input
-            type="range"
-            min="0.1"
-            max="5"
-            step="0.1"
-            :value="grid.cellSize"
-            @input="setGrid({ cellSize: Number(($event.target as HTMLInputElement).value) })"
-          />
-        </label>
-        <label class="field">
-          <span>Divisions <b>{{ grid.divisions }}</b></span>
-          <input
-            type="range"
-            min="4"
-            max="120"
-            step="1"
-            :value="grid.divisions"
-            @input="setGrid({ divisions: Number(($event.target as HTMLInputElement).value) })"
-          />
-        </label>
-      </section>
-
-      <section>
-        <h2>Mode</h2>
-        <div class="segmented" role="group" aria-label="Interaction mode">
-          <button
-            type="button"
-            :class="{ on: mode === 'fk' }"
-            @click="setMode('fk')"
-          >
-            FK
-          </button>
-          <button
-            type="button"
-            :class="{ on: mode === 'ik' }"
-            @click="setMode('ik')"
-          >
-            IK
-          </button>
-        </div>
-        <p class="hint">
-          {{
-            mode === "fk"
-              ? "Click a joint, then drag the rotation rings."
-              : "Click a hand or foot to drag the end effector."
-          }}
-        </p>
-      </section>
-
-      <section v-if="activeModelId">
-        <h2>Pose</h2>
-        <button type="button" class="chip wide" @click="resetPose">
-          Reset pose
-        </button>
-        <p v-if="poseError" class="hint warn">{{ poseError }}</p>
-
-        <h3 class="sub">Surgery</h3>
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            :disabled="!selectedBone"
-            title="Restore the selected joint to bind, leaving the rest of the pose alone"
-            @click="resetSelectedJoint()"
-          >
-            Reset joint
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Mirror only the arm chain"
-            @click="mirrorArmLimb()"
-          >
-            Mirror arms
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Mirror only the leg chain"
-            @click="mirrorLegLimb()"
-          >
-            Mirror legs
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Switch Pose Sides — mirror the whole body"
-            @click="switchPoseSides()"
-          >
-            Switch sides
-          </button>
-        </div>
-
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            title="Copy the current pose to the clipboard"
-            @click="copyPose()"
-          >
-            Copy pose
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Paste the clipboard pose onto this model"
-            @click="pastePose()"
-          >
-            Paste pose
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: inPlace }"
-            title="Apply poses without their root drop, so the figure stays put"
-            @click="toggleInPlace()"
-          >
-            In place
-          </button>
-          <button
-            type="button"
-            class="chip"
-            title="Apply a random pose from the current filter"
-            @click="applyRandomPose()"
-          >
-            Random
-          </button>
-        </div>
-        <p v-if="clipboardStatus" class="hint">{{ clipboardStatus }}</p>
-
-        <label class="field">
-          <span>Search poses</span>
-          <input
-            v-model="poseSearch"
-            type="search"
-            placeholder="e.g. sword, wave, kneel"
-          />
-        </label>
-
-        <div class="tags">
-          <button
-            v-for="tag in allPoseTags"
-            :key="tag"
-            type="button"
-            class="tag"
-            :class="{ on: poseTagFilter.includes(tag) }"
-            @click="togglePoseTag(tag)"
-          >
-            {{ tag }}
-          </button>
-        </div>
-
-        <div class="pose-grid">
-          <button
-            v-for="pose in visiblePoses"
-            :key="pose.id"
-            type="button"
-            class="pose-tile"
-            :class="{ on: appliedPoseId === pose.id }"
-            :title="`${pose.name} — ${pose.tags.join(', ')}`"
-            @click="applyPose(pose)"
-          >
-            <img
-              v-if="poseThumbs[pose.id]"
-              :src="poseThumbs[pose.id]"
-              :alt="`${pose.name} pose`"
-            />
-            <span v-else class="thumb placeholder" aria-hidden="true"></span>
-            <span class="pose-name">{{ pose.name }}</span>
-          </button>
-        </div>
-        <p class="hint">
-          {{ visiblePoses.length }}
-          {{ visiblePoses.length === 1 ? "pose" : "poses" }} shown
-        </p>
-        <p v-if="poseLibraryError" class="hint warn">
-          Generated poses unavailable: {{ poseLibraryError }}
-        </p>
-        <p v-else-if="generatedPoseCount" class="hint">
-          Including {{ generatedPoseCount }} generated poses.
-        </p>
-      </section>
-
-      <section v-if="objectOptions.length">
-        <h2>Object</h2>
-        <label class="field">
-          <span>Selected</span>
-          <select
-            :value="selectedObjectId ?? ''"
-            @change="selectObject(($event.target as HTMLSelectElement).value || null)"
-          >
-            <option value="">None</option>
-            <option
-              v-for="opt in objectOptions"
-              :key="opt.id"
-              :value="opt.id"
-            >
-              {{ opt.label }}
-            </option>
-          </select>
-        </label>
-
-        <div class="row gizmo-modes" role="group" aria-label="Object transform mode">
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: objectGizmoMode === 'translate' }"
-            title="Move (G)"
-            @click="setObjectGizmoMode('translate')"
-          >
-            Move
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: objectGizmoMode === 'rotate' }"
-            title="Rotate (Shift+R)"
-            @click="setObjectGizmoMode('rotate')"
-          >
-            Rotate
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: objectGizmoMode === 'scale' }"
-            title="Scale (S)"
-            @click="setObjectGizmoMode('scale')"
-          >
-            Scale
-          </button>
-        </div>
-
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            :disabled="!selectedObjectId"
-            title="Duplicate (Shift+D)"
-            @click="duplicateSelectedObject()"
-          >
-            Duplicate
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :disabled="!selectedObjectId"
-            title="Show / hide (Shift+H)"
-            @click="toggleObjectHidden()"
-          >
-            Hide / Show
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :disabled="!selectedObjectId"
-            title="Lock / unlock (L)"
-            @click="toggleObjectLocked()"
-          >
-            Lock
-          </button>
-          <button
-            type="button"
-            class="chip danger"
-            :disabled="!selectedObjectId"
-            title="Delete (Del)"
-            @click="deleteSelectedObject()"
-          >
-            Delete
-          </button>
-        </div>
-
-        <label class="field">
-          <span>Colour</span>
-          <input
-            type="color"
-            :disabled="!selectedObjectId"
-            @input="setSelectedObjectColor(($event.target as HTMLInputElement).value)"
-          />
-        </label>
-        <button
-          type="button"
-          class="chip wide"
-          :disabled="!selectedObjectId"
-          @click="setSelectedObjectColor(null)"
-        >
-          Clear colour
-        </button>
-        <p class="hint">
-          The gizmo moves the whole object. FK still rotates a single joint.
-        </p>
-      </section>
-
-      <section v-if="activeModelId" class="vendor-lib">
-        <h2>Reference library</h2>
-        <p class="hint">
-          {{ vendorPoseIndex.length.toLocaleString() }} reference poses,
-          {{ visibleVendorProps.length.toLocaleString() }} props and
-          {{ vendorSceneIndex.length.toLocaleString() }} scenes, fetched from the
-          local asset library on demand.
-        </p>
-        <p v-if="vendorPoseError" class="hint warn">
-          Reference poses unavailable: {{ vendorPoseError }}
-        </p>
-
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: libraryTab === 'poses' }"
-            @click="libraryTab = 'poses'"
-          >
-            Poses
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: libraryTab === 'props' }"
-            @click="libraryTab = 'props'"
-          >
-            Props
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: libraryTab === 'scenes' }"
-            @click="libraryTab = 'scenes'"
-          >
-            Scenes
-          </button>
-        </div>
-
-        <label class="field">
-          <span>Search library</span>
-          <input v-model="librarySearch" type="search" placeholder="e.g. sword, dance, chair" />
-        </label>
-
-        <template v-if="libraryTab === 'poses'">
-          <p v-if="!vendorPoseIndex.length" class="hint">No reference poses loaded.</p>
-          <div v-else class="pose-grid vendor-grid">
-            <button
-              v-for="row in filteredVendorPoses"
-              :key="row.id"
-              type="button"
-              class="pose-tile"
-              :title="`${row.name} — ${row.category}`"
-              @click="applyVendorPose(row)"
-            >
-              <img
-                v-if="vendorThumb(row)"
-                :src="vendorThumb(row)!"
-                :alt="`${row.name} reference`"
-                loading="lazy"
-              />
-              <span v-else class="thumb placeholder" aria-hidden="true"></span>
-              <span class="pose-name">{{ row.name }}</span>
-            </button>
-          </div>
-          <p class="hint">
-            {{ filteredVendorPoses.length.toLocaleString() }} of
-            {{ vendorPoseIndex.length.toLocaleString() }} poses
-          </p>
-        </template>
-
-        <template v-else-if="libraryTab === 'props'">
-          <label class="field">
-            <span>Family</span>
-            <select v-model="vendorPropFamily">
-              <option :value="null">All families</option>
-              <option v-for="f in vendorPropFamilies" :key="f" :value="f">{{ f }}</option>
-            </select>
-          </label>
-          <div class="prop-grid vendor-grid">
-            <button
-              v-for="prop in visibleVendorProps"
-              :key="prop.id"
-              type="button"
-              class="prop-tile"
-              :title="prop.name"
-              @click="addVendorProp(prop)"
-            >
-              <img
-                v-if="vendorPropThumb(prop)"
-                :src="vendorPropThumb(prop)!"
-                :alt="`${prop.name} prop`"
-                loading="lazy"
-              />
-              <span v-else class="thumb placeholder" aria-hidden="true"></span>
-              <span class="pose-name">{{ prop.name.trim() }}</span>
-            </button>
-          </div>
-          <p class="hint">{{ visibleVendorProps.length.toLocaleString() }} props</p>
-        </template>
-
-        <template v-else>
-          <p v-if="vendorSceneError" class="hint warn">{{ vendorSceneError }}</p>
-          <p v-else-if="!vendorSceneIndex.length" class="hint">No reference scenes loaded.</p>
-          <ul v-else class="list vendor-list">
-            <li v-for="row in visibleVendorScenes" :key="row.id">
-              <button type="button" :title="row.description" @click="applyVendorScene(row)">
-                {{ row.name }}
-              </button>
-            </li>
-          </ul>
-          <p class="hint">{{ visibleVendorScenes.length.toLocaleString() }} scenes</p>
-        </template>
-      </section>
-
-      <section v-if="activeModelId">
-        <h2>Hand poses</h2>
-        <p class="hint">
-          Hands transfer independently of the body, so a finished pose keeps its
-          articulation while you refine the hands.
-        </p>
-        <div class="row wrap">
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: handSide === 'Left' }"
-            @click="setHandSide('Left')"
-          >
-            Left
-          </button>
-          <button
-            type="button"
-            class="chip"
-            :class="{ on: handSide === 'Right' }"
-            @click="setHandSide('Right')"
-          >
-            Right
-          </button>
-        </div>
-        <div class="row wrap">
-          <button type="button" class="chip" @click="copyHandPose()">
-            Copy pose (and hand)
-          </button>
-          <button type="button" class="chip" @click="pasteHandOnly()">
-            Paste hand only
-          </button>
-          <button type="button" class="chip" @click="resetHands()">
-            Reset hands
-          </button>
-        </div>
-        <p v-if="handPoseStatus" class="hint">{{ handPoseStatus }}</p>
-        <p v-if="handPoseError" class="hint warn">{{ handPoseError }}</p>
-
-        <label class="field">
-          <span>Search hand poses</span>
-          <input
-            v-model="handPoseSearch"
-            type="search"
-            placeholder="e.g. grip, point, fist"
-          />
-        </label>
-        <div class="pose-grid">
-          <button
-            v-for="pose in visibleHandPoses"
-            :key="pose.id"
-            type="button"
-            class="pose-tile hand-tile"
-            :title="`${pose.name} — ${pose.tags.join(', ')}`"
-            @click="applyHandPose(pose)"
-          >
-            <span class="thumb placeholder hand-thumb" aria-hidden="true"></span>
-            <span class="pose-name">{{ pose.name }}</span>
-          </button>
-        </div>
-        <p class="hint">
-          {{ visibleHandPoses.length }}
-          {{ visibleHandPoses.length === 1 ? "hand pose" : "hand poses" }}
-        </p>
-      </section>
-
-      <section v-if="activeModelId">
-        <h2>Animation</h2>
-        <p v-if="clipError" class="hint warn">{{ clipError }}</p>
-        <p v-else-if="clipSummaries.length === 0" class="hint">
-          Loading clips...
-        </p>
-        <template v-else>
-          <label class="field">
-            <span>Search clips</span>
-            <input v-model="clipSearch" type="search" placeholder="clip id" />
-          </label>
-
-          <div class="clip-list">
-            <button
-              v-for="clip in visibleClips.slice(0, 40)"
-              :key="clip.id"
-              type="button"
-              class="clip-row"
-              :class="{ on: clip.id === activeClipId }"
-              @click="selectClip(clip.id)"
-            >
-              {{ clip.name }}
-              <span class="clip-meta">{{ clip.durationSeconds.toFixed(1) }}s</span>
-            </button>
-          </div>
-
-          <div v-if="activeClipId" class="transport">
-            <div class="transport-buttons">
-              <button
-                type="button"
-                class="chip small"
-                title="Previous frame"
-                @click="stepClip(-1)"
-              >
-                &#9664;&#9646;
-              </button>
-              <button type="button" class="chip small wide" @click="togglePlayback">
-                {{ playing ? "Pause" : "Play" }}
-              </button>
-              <button
-                type="button"
-                class="chip small"
-                title="Next frame"
-                @click="stepClip(1)"
-              >
-                &#9654;&#9646;
-              </button>
-              <button
-                type="button"
-                class="chip small"
-                title="Stop"
-                @click="stopPlayback"
-              >
-                &#9632;
-              </button>
-            </div>
-            <input
-              class="scrub"
-              type="range"
-              min="0"
-              :max="clipDuration"
-              step="0.01"
-              :value="clipTime"
-              @input="seekClip(Number(($event.target as HTMLInputElement).value))"
-            />
-            <p class="hint">
-              frame {{ clipFrame }} &middot;
-              {{ clipTime.toFixed(2) }}s / {{ clipDuration.toFixed(2) }}s
-            </p>
-          </div>
-        </template>
-      </section>
-
-      <section>
-        <h2>Props</h2>
-        <p v-if="propError" class="hint warn">{{ propError }}</p>
-
-        <div v-for="[family, items] in propGroups" :key="family" class="group">
-          <h3>{{ family }}</h3>
-          <div class="grid">
-            <button
-              v-for="p in items"
-              :key="p.id"
-              type="button"
-              class="chip"
-              @click="addProp(p)"
-            >
-              {{ p.name }}
-            </button>
-          </div>
-        </div>
-
-        <label class="file-btn">
-          Import .obj / .glb
-          <input
-            type="file"
-            accept=".obj,.glb,.gltf"
-            hidden
-            @change="onPropFile"
-          />
-        </label>
-
-        <div v-if="props.length" class="prop-list">
-          <div
-            v-for="placed in props"
-            :key="placed.id"
-            class="prop-row"
-            :class="{ on: placed.id === selectedPropId }"
-          >
-            <span
-              class="prop-name"
-              role="button"
-              tabindex="0"
-              @click="selectedPropId = placed.id"
-            >
-              {{ placed.config.name }}
-            </span>
-            <span class="prop-actions">
-              <button
-                type="button"
-                class="chip tiny"
-                title="Drop to floor"
-                @click="dropPropToFloor(placed.id)"
-              >
-                v
-              </button>
-              <button
-                type="button"
-                class="chip tiny"
-                title="Place at the figure's feet"
-                @click="placePropAtBone(placed.id, 'LeftFoot')"
-              >
-                @
-              </button>
-              <button
-                type="button"
-                class="chip tiny danger"
-                :aria-label="`Remove ${placed.config.name}`"
-                @click="removeProp(placed.id)"
-              >
-                &times;
-              </button>
-            </span>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <h2>Image planes</h2>
-        <p v-if="imagePlanes.length === 0" class="hint">
-          Import an image to compose and check perspective against it.
-        </p>
-        <div class="prop-list">
-          <div v-for="plane in imagePlanes" :key="plane.id" class="prop-row">
-            <span class="prop-name">{{ plane.name }}</span>
-            <button
-              type="button"
-              class="chip tiny danger"
-              :aria-label="`Remove ${plane.name}`"
-              @click="removeImagePlane(plane.id)"
-            >
-              &times;
-            </button>
-          </div>
-        </div>
-        <label class="file-btn">
-          {{ imagePlanes.length ? "Add another" : "Add image plane" }}
-          <input type="file" accept="image/*" hidden @change="onImageFile" />
-        </label>
-      </section>
-
-      <section>
-        <h2>Scene</h2>
-        <p v-if="sceneError" class="hint warn">{{ sceneError }}</p>
-
-        <label class="field">
-          <span>Name</span>
-          <input v-model="sceneName" type="text" placeholder="Untitled" />
-        </label>
-
-        <div class="transport-buttons">
-          <button
-            type="button"
-            class="chip small"
-            :disabled="!canUndo"
-            title="Undo (Ctrl+Z)"
-            @click="undo()"
-          >
-            Undo
-          </button>
-          <button
-            type="button"
-            class="chip small"
-            :disabled="!canRedo"
-            title="Redo (Ctrl+Shift+Z)"
-            @click="redo()"
-          >
-            Redo
-          </button>
-        </div>
-
-        <div class="scene-buttons">
-          <button type="button" class="chip wide" @click="saveCurrentScene()">
-            Save
-          </button>
-          <button type="button" class="chip wide" @click="exportCurrentScene()">
-            Export file
-          </button>
-        </div>
-
-        <label class="file-btn">
-          Import scene file
-          <input type="file" accept=".json,application/json" hidden @change="onSceneFile" />
-        </label>
-
-        <h3 class="sub">Premade</h3>
-        <div class="scene-list">
-          <button
-            v-for="s in premadeScenes"
-            :key="s.name"
-            type="button"
-            class="scene-row"
-            :title="s.description"
-            @click="loadPremadeScene(s.name)"
-          >
-            {{ s.name }}
-          </button>
-        </div>
-
-        <template v-if="savedScenes.length">
-          <h3 class="sub">Saved</h3>
-          <div class="scene-list">
-            <div v-for="s in savedScenes" :key="s.name" class="scene-row saved">
-              <span class="scene-name" @click="openSavedScene(s.name)">
-                {{ s.name }}
-              </span>
-              <button
-                type="button"
-                class="chip tiny danger"
-                :aria-label="`Delete ${s.name}`"
-                @click="deleteSavedScene(s.name)"
-              >
-                &times;
-              </button>
-            </div>
-          </div>
-        </template>
-      </section>
-
-      <section v-if="activeModelId">
-        <h2>Joints</h2>
-        <p class="hint">
-          {{
-            selectedBone
-              ? `Selected: ${selectedBone}`
-              : "No joint selected"
-          }}
-        </p>
-        <div class="grid bones">
-          <button
-            v-for="b in boneNames"
-            :key="b"
-            type="button"
-            class="chip small"
-            :class="{ on: b === selectedBone }"
-            @click="selectBone(b)"
-          >
-            {{ b }}
-          </button>
-        </div>
-      </section>
-    </aside>
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="exportError" class="error" role="alert">{{ exportError }}</p>
@@ -2514,13 +1570,71 @@ watch(
   left: 12px;
 }
 
-.panel-right {
-  right: 12px;
-  /* The reference library is the reason this panel still exists: it lists
-   * thousands of poses with thumbnails, which needs more room than the old
-   * 216px sidebar gave it. */
-  width: 360px;
-  max-width: calc(100vw - 24px);
+.model-dock {
+  position: fixed;
+  z-index: 3;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 2px;
+  max-width: calc(100vw - 16px);
+  overflow-x: auto;
+  padding: 4px;
+  border: 1px solid var(--poseify-border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--poseify-panel) 92%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 18px #0006;
+}
+
+.model-tool {
+  position: relative;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--poseify-text);
+  font-size: 22px;
+  cursor: pointer;
+}
+
+.model-tool:hover,
+.model-tool.on {
+  background: color-mix(in srgb, var(--poseify-accent) 30%, transparent);
+}
+
+.model-tool.danger {
+  color: #f87171;
+}
+
+.color-tool input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+@media (max-width: 600px) {
+  .model-dock {
+    justify-content: flex-start;
+    left: 8px;
+    right: 8px;
+    transform: none;
+  }
+
+  .model-tool {
+    flex-basis: 36px;
+    width: 36px;
+    height: 36px;
+  }
 }
 
 .panel h2 {
@@ -2697,19 +1811,13 @@ button.chip.tile.loading {
   opacity: 0.6;
 }
 
-/* ------------------------------------------------------- PoseMy.Art shell
- *
- * Round icon buttons on two rails, a contextual toolbar, and overlays over
- * the canvas. No permanent side panels: the 3D view is the app, the chrome
- * floats on it. 46px matches PoseMy.Art's button size so the muscle memory
- * transfers.
- */
+/* Compact controls float above the canvas; detailed tools stay in panels. */
 .rail {
   position: fixed;
-  top: 10px;
+  top: 8px;
   z-index: 3;
   display: flex;
-  gap: 2px;
+  gap: 4px;
 }
 
 .rail-top-left {
@@ -2720,30 +1828,81 @@ button.chip.tile.loading {
   right: 4px;
 }
 
+.rail-bottom-left {
+  top: auto;
+  bottom: 10px;
+  left: 8px;
+}
+
+.light-panel {
+  position: fixed;
+  z-index: 3;
+  left: 12px;
+  bottom: 54px;
+  width: min(280px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border: 1px solid var(--poseify-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--poseify-panel) 96%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.light-modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin-bottom: 10px;
+}
+
+.light-modes button {
+  padding: 6px 4px;
+  border: 1px solid var(--poseify-border);
+  background: #232833;
+  color: var(--poseify-text);
+  cursor: pointer;
+}
+
+.light-modes button:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.light-modes button:last-child {
+  border-radius: 0 6px 6px 0;
+}
+
+.light-modes button.on {
+  border-color: var(--poseify-accent);
+  background: color-mix(in srgb, var(--poseify-accent) 30%, #232833);
+}
+
 .icon-btn {
-  width: 46px;
-  height: 46px;
+  width: 34px;
+  height: 34px;
   display: grid;
   place-items: center;
   padding: 0;
   border: 0;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--poseify-panel) 86%, transparent);
-  backdrop-filter: blur(8px);
+  border-radius: 6px;
+  background: transparent;
   color: var(--poseify-text);
-  font-size: 18px;
+  font-size: 21px;
   line-height: 1;
   cursor: pointer;
-  transition: background 120ms ease, transform 120ms ease;
+  transition: background 120ms ease;
 }
 
 .icon-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--poseify-accent) 34%, var(--poseify-panel));
-  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--poseify-panel) 76%, transparent);
 }
 
 .icon-btn:active:not(:disabled) {
-  transform: translateY(0);
+  background: color-mix(in srgb, var(--poseify-accent) 35%, var(--poseify-panel));
 }
 
 .icon-btn.on {
@@ -2756,9 +1915,19 @@ button.chip.tile.loading {
 }
 
 .icon-btn.close {
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   font-size: 20px;
+}
+
+.icon-btn svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .visually-hidden {
@@ -2795,102 +1964,15 @@ button.chip.tile.loading {
   color: #ff8f6b;
 }
 
-/* Contextual toolbar for the selected object. Sits just under the rails so it
- * never overlaps them, and scrolls horizontally on a narrow window rather
- * than wrapping into the canvas. */
-.context-bar {
-  position: fixed;
-  top: 66px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  max-width: calc(100vw - 24px);
-  padding: 6px 8px;
-  border: 1px solid var(--poseify-border);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--poseify-panel) 92%, transparent);
-  backdrop-filter: blur(10px);
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-
-.context-bar .segmented {
-  display: flex;
-  gap: 2px;
-  grid-template-columns: none;
-}
-
-/* With the library panel open the toolbar centres in the space that is left,
- * so it stops sliding under the panel's edge on a narrow window. */
-.context-bar.with-panel {
-  left: calc(50% - 186px);
-  max-width: calc(100vw - 408px);
-}
-
-.context-bar .segmented button {
-  padding: 6px 12px;
-  white-space: nowrap;
-}
-
-.context-divider {
-  width: 1px;
-  height: 22px;
-  background: var(--poseify-border);
-  flex: 0 0 auto;
-}
-
-.tool-btn {
-  padding: 7px 12px;
-  border: 1px solid var(--poseify-border);
-  border-radius: 8px;
-  background: #232833;
-  color: var(--poseify-text);
-  font-size: 12px;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.tool-btn:hover {
-  border-color: var(--poseify-accent);
-}
-
-.tool-btn.danger {
-  color: #ff8080;
-}
-
-.tool-swatch {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--poseify-border);
-  border-radius: 8px;
-  background: #232833;
-  cursor: pointer;
-  flex: 0 0 auto;
-}
-
-.tool-swatch input {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: 0;
-  background: none;
-  cursor: pointer;
-}
-
 /* Overlay surface: large, centred, and offset from the rails so it never
  * covers the buttons that opened it. */
 .overlay {
   position: fixed;
   z-index: 4;
-  top: 66px;
-  left: 60px;
-  right: 60px;
-  bottom: 20px;
+  top: 52px;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--poseify-border);
@@ -2899,6 +1981,14 @@ button.chip.tile.loading {
   backdrop-filter: blur(12px);
   box-shadow: 0 18px 50px rgb(0 0 0 / 45%);
   overflow: hidden;
+}
+
+.overlay.hand-overlay {
+  right: auto;
+  width: min(600px, calc(100vw - 24px));
+  top: 8px;
+  bottom: 8px;
+  border-radius: 0 8px 8px 0;
 }
 
 .overlay-head {
@@ -2929,13 +2019,7 @@ button.chip.tile.loading {
   gap: 14px;
 }
 
-/* The left panel is fully superseded by the rails and overlays, so it never
- * renders: two panels plus the new chrome was the layout problem the overlay
- * shell fixed. The right panel is different - the reference library, hand
- * poses, joint groups and anchors were never ported into an overlay pane, so
- * it stays and is toggled from the rail instead. Remove the aside elements
- * once those sections have been ported too.
- */
+/* The old side panel is superseded by the rails, dock, and focused overlays. */
 .panel-left {
   display: none;
 }
@@ -2983,6 +2067,90 @@ button.chip.tile.loading {
   max-height: none;
   overflow-y: visible;
   margin-top: 0;
+}
+
+.hand-pose-browser {
+  gap: 8px;
+}
+
+.hand-side-tabs {
+  display: flex;
+  width: min(520px, 100%);
+  background: #292929;
+}
+
+.hand-side-tabs button {
+  flex: 1;
+  min-height: 34px;
+  border: 0;
+  background: transparent;
+  color: var(--poseify-text);
+  cursor: pointer;
+}
+
+.hand-side-tabs button.on {
+  background: #4b4b4b;
+}
+
+.overlay-pane .hand-pose-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.hand-pose-tile img,
+.hand-preview-loading {
+  width: 100%;
+  height: 104px;
+  object-fit: cover;
+  border-radius: 3px;
+  background: #1b1b1b;
+}
+
+.hand-preview-loading {
+  display: block;
+  background: #1b1b1b;
+}
+
+.animation-browser {
+  max-width: 1040px;
+}
+
+.overlay-pane .animation-grid {
+  grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
+  gap: 8px;
+}
+
+.animation-tile {
+  position: relative;
+}
+
+.animation-tile .clip-meta {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: #111c;
+}
+
+.animation-empty {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--poseify-border);
+  border-radius: 6px;
+  color: var(--poseify-text-dim);
+}
+
+.animation-transport {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 600px;
+}
+
+.animation-transport .scrub {
+  flex: 1;
 }
 
 /* Prop and export-pass buttons flow rather than sitting in the old 2-column

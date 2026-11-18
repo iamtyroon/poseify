@@ -41,6 +41,15 @@ export function setDecoderPaths(paths: {
 let dracoLoader: DRACOLoader | null = null;
 let ktx2Loader: KTX2Loader | null = null;
 
+function restoreSkinBindPose(root: THREE.Object3D): void {
+  const skeletons = new Set<THREE.Skeleton>();
+  root.traverse((object) => {
+    if (object instanceof THREE.SkinnedMesh) skeletons.add(object.skeleton);
+  });
+  for (const skeleton of skeletons) skeleton.pose();
+  root.updateMatrixWorld(true);
+}
+
 function getDraco(): DRACOLoader {
   if (!dracoLoader) {
     dracoLoader = new DRACOLoader();
@@ -89,6 +98,7 @@ export async function loadModelFromURL(
         const ktx2 = getKTX2(options.renderer);
         if (ktx2) loader.setKTX2Loader(ktx2);
         const gltf = await loader.loadAsync(url);
+        restoreSkinBindPose(gltf.scene);
         return { root: gltf.scene, format };
       }
       case "fbx": {
@@ -99,6 +109,7 @@ export async function loadModelFromURL(
         // FBXLoader has no Draco path: FBX stores geometry uncompressed, and
         // three's FBXLoader does not expose setDRACOLoader. Only GLTF does.
         const root = await loader.loadAsync(url);
+        restoreSkinBindPose(root);
         return { root, format };
       }
       case "obj": {

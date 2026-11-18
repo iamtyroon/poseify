@@ -48,7 +48,6 @@ import {
 import { exportSceneObj, type SceneObjSource } from "../export/ObjExport";
 import type { ObjExportResult } from "../export/Exporter";
 import { POSE_LIBRARY } from "../pose/PoseLibrary";
-import { loadGeneratedPoses } from "../pose/GeneratedPoseLibrary";
 import {
   loadVendorPose,
   loadVendorPoseIndex,
@@ -319,6 +318,16 @@ export function usePosing() {
     // Handles belong to whichever figure is active, and an attach in flight
     // targets that figure's joints.
     refreshHandles();
+  }
+
+  /** Switch figures while carrying the current joint rotations onto the new rig. */
+  function activateModelWithPose(id: string): void {
+    const target = models.value.find((model) => model.config.id === id);
+    if (!target || id === activeModelId.value) return;
+    const source = activeSkeleton();
+    if (source) target.skeleton.applyPose(source.getPose());
+    setActive(id);
+    commit();
   }
 
   function selectBone(name: string | null): void {
@@ -948,10 +957,8 @@ export function usePosing() {
     // instead of selecting a bone. The handles do the picking, so the target
     // is guaranteed to be a joint the artist can actually see.
     pc.onViewportClick = (event) => {
-      if (attachModeFor.value === null) return;
       const vp = viewport.value;
-      const handles = jointHandles.value;
-      if (!vp || !handles) return true;
+      if (!vp) return;
       const rect = vp.renderer.domElement.getBoundingClientRect();
       const raycaster = new THREE.Raycaster();
       const ndc = new THREE.Vector2(
@@ -959,8 +966,30 @@ export function usePosing() {
         -((event.clientY - rect.top) / rect.height) * 2 + 1,
       );
       raycaster.setFromCamera(ndc, vp.camera);
-      attachPendingPropToBone(handles.pickBone(raycaster, DEFAULT_PICK_RADIUS));
-      return true;
+      if (attachModeFor.value !== null) {
+        const handles = jointHandles.value;
+        if (!handles) return true;
+        attachPendingPropToBone(handles.pickBone(raycaster, DEFAULT_PICK_RADIUS));
+        return true;
+      }
+
+      const objects = selectableObjects();
+      const hit = raycaster.intersectObjects(objects.map((object) => object.root), true)[0];
+      const selected = hit
+        ? objects.find(({ root }) => {
+            let node: THREE.Object3D | null = hit.object;
+            while (node && node !== root) node = node.parent;
+            return node === root;
+          })
+        : undefined;
+      const model = selected && models.value.find((item) => item.instanceId === selected.id);
+      if (model) {
+        setActive(model.config.id);
+        selectObject(model.instanceId);
+      } else {
+        selectObject(selected?.id ?? null);
+        setActive(null);
+      }
     };
     vp.scene.add(pc.helper);
     controller.value = pc;
@@ -1195,11 +1224,6 @@ export function usePosing() {
   // its root drop rather than needing the artist to re-pick it.
   const lastPose = shallowRef<Pose | null>(null);
 
-  // Phase 7: the generated library is fetched once and merged in. The authored
-  // 98 come first so a freshly opened picker leads with the hand-written poses
-  // an artist curated, rather than 1,200 generated ones.
-  const generatedPoses = shallowRef<readonly Pose[]>([]);
-
   // Vendor pose library: the creator-approved scrape, fetched once. Kept as a
   // separate source rather than merged into the local libraries so the picker
   // can show where a pose came from and so a missing vendor payload degrades
@@ -1274,37 +1298,10 @@ export function usePosing() {
   function vendorThumb(summary: VendorPoseSummary): string | null {
     return vendorPoseThumb(summary);
   }
-  const poseLibraryError = ref<string | null>(null);
-
-  /**
-   * Fetch the generated library once, and never let a missing payload take the
-   * picker down: the authored poses still work and the message says how to
-   * rebuild.
-   */
-  async function loadGeneratedLibrary(): Promise<void> {
-    try {
-      generatedPoses.value = await loadGeneratedPoses();
-      poseLibraryError.value = null;
-    } catch (err) {
-      poseLibraryError.value = err instanceof Error ? err.message : String(err);
-    }
-  }
-
-  /** Total poses across both libraries, for the picker count. */
-  const generatedPoseCount = computed(() => generatedPoses.value.length);
-
-  const poseLibrary = computed<readonly Pose[]>(() => [
-    ...POSE_LIBRARY,
-    ...generatedPoses.value,
-  ]);
-
-  // Must be a computed, not a one-shot call: the generated library arrives after
-  // setup, so a value read here would be captured from an empty array and the
-  // picker would only ever offer the authored tags.
-  const allPoseTags = computed(() => collectTags(poseLibrary.value));
+  const allPoseTags = computed(() => collectTags(POSE_LIBRARY));
 
   const visiblePoses = computed(() =>
-    filterPoses(poseLibrary.value, {
+    filterPoses(POSE_LIBRARY, {
       search: poseSearch.value,
       tags: poseTagFilter.value,
     }),
@@ -1657,9 +1654,8 @@ export function usePosing() {
     const handles = jointHandles.value;
     if (!handles) return;
     handles.setSkeleton(activeSkeleton());
-    // Visible whenever the mode is live, so the artist can see the joints they
-    // are about to choose. Left off otherwise so posing stays uncluttered.
-    handles.setVisible(attachModeFor.value !== null);
+    // Keep pose handles visible by default; attach mode forces them on too.
+    handles.setVisible(jointHandlesVisible.value || attachModeFor.value !== null);
     handles.setHighlighted(attachModeFor.value !== null);
   }
 
@@ -1747,7 +1743,7 @@ export function usePosing() {
     jointHandlesVisible.value = visible;
   }
 
-  const jointHandlesVisible = ref(false);
+  const jointHandlesVisible = ref(true);
 
   // ------------------------------------------- Phase 1: object-level operations
 
@@ -2487,6 +2483,7 @@ export function usePosing() {
     dispose,
     attachModel,
     setActive,
+    activateModelWithPose,
     selectBone,
     selectObject,
     setObjectGizmoMode,
@@ -2559,8 +2556,6 @@ export function usePosing() {
     poseTagFilter,
     appliedPoseId,
     poseError,
-    poseLibraryError,
-    generatedPoseCount,
     loadVendorPoseLibrary,
     vendorPoseIndex,
     vendorPoseError,
@@ -2568,7 +2563,6 @@ export function usePosing() {
     visibleVendorPoses,
     applyVendorPose,
     vendorThumb,
-    loadGeneratedLibrary,
     poseThumbs,
     allPoseTags,
     visiblePoses,

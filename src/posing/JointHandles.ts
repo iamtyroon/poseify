@@ -17,8 +17,10 @@ import * as THREE from "three";
 import type { PosableSkeleton } from "./PosableSkeleton";
 
 /** Radius floor/ceiling, in the same units as gizmoSizeFor. */
-const MIN_RADIUS = 0.012;
-const MAX_RADIUS = 0.09;
+const MIN_RADIUS = 0.003;
+const MAX_RADIUS = 0.035;
+
+type HandleColor = "left" | "right" | "center" | "hips" | "highlight";
 
 export interface JointHandlesOptions {
   /**
@@ -39,10 +41,11 @@ export interface JointHandlesOptions {
  */
 export class JointHandles {
   private readonly group = new THREE.Group();
-  private readonly geometry: THREE.SphereGeometry;
-  private readonly material: THREE.MeshBasicMaterial;
+  private readonly geometry: THREE.CylinderGeometry;
+  private readonly materials: Record<HandleColor, THREE.MeshBasicMaterial>;
   private skeleton: PosableSkeleton | null = null;
   private visible = false;
+  private highlighted = false;
 
   /** Fired when the user clicks a handle while attach mode is active. */
   onPick: ((boneName: string) => void) | null = null;
@@ -50,15 +53,27 @@ export class JointHandles {
   constructor(options: JointHandlesOptions = {}) {
     this.group.name = "JointHandles";
     this.group.visible = false;
-    this.geometry = new THREE.SphereGeometry(1, 12, 10);
-    this.material = new THREE.MeshBasicMaterial({
-      color: 0x4ea1ff,
-      transparent: true,
-      opacity: 0.55,
-      // depthTest off so a handle behind the mesh is still visible and still
-      // clickable. A handle you cannot see is a handle you cannot trust.
-      depthTest: false,
-    });
+    this.geometry = new THREE.CylinderGeometry(0.78, 1, 0.9, 6, 1);
+    this.geometry.rotateX(Math.PI / 2);
+    const material = (color: number) =>
+      new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.72,
+        metalness: 0.04,
+        flatShading: true,
+        transparent: true,
+        opacity: 0.9,
+        // depthTest off so a handle behind the mesh is still visible and still
+        // clickable. A handle you cannot see is a handle you cannot trust.
+        depthTest: false,
+      });
+    this.materials = {
+      left: material(0x4268e8),
+      right: material(0xc95555),
+      center: material(0x4da85c),
+      hips: material(0xb4a83d),
+      highlight: material(0xffc53d),
+    };
     if (options.exclude?.length) {
       this.group.userData.exclude = [...options.exclude];
     }
@@ -98,7 +113,10 @@ export class JointHandles {
     );
     for (const name of skeleton.getBoneNames()) {
       if (exclude.has(name)) continue;
-      const mesh = new THREE.Mesh(this.geometry, this.material);
+      const mesh = new THREE.Mesh(
+        this.geometry,
+        this.highlighted ? this.materials.highlight : this.materialForBone(name),
+      );
       mesh.name = `JointHandle:${name}`;
       mesh.userData.boneName = name;
       // Handles must never intercept an orbit drag. Picking happens in JS from
@@ -116,10 +134,18 @@ export class JointHandles {
     this.group.visible = visible && this.count > 0;
   }
 
-  /** Switch the handles into the highlighted attach colour. */
+  /** Highlight all handles while the user is choosing a joint for a prop. */
   setHighlighted(on: boolean): void {
-    this.material.color.set(on ? 0xffc53d : 0x4ea1ff);
-    this.material.opacity = on ? 0.95 : 0.55;
+    this.highlighted = on;
+    for (const child of this.group.children) {
+      const mesh = child as THREE.Mesh;
+      const name = mesh.userData.boneName as string | undefined;
+      if (name) {
+        mesh.material = on
+          ? this.materials.highlight
+          : this.materialForBone(name);
+      }
+    }
   }
 
   /**
@@ -130,18 +156,34 @@ export class JointHandles {
    */
   sync(): void {
     if (!this.skeleton) return;
+    const worldPosition = new THREE.Vector3();
+    const childPosition = new THREE.Vector3();
+    this.group.updateMatrixWorld(true);
     for (const child of this.group.children) {
       const mesh = child as THREE.Mesh;
       const name = mesh.userData.boneName as string | undefined;
       if (!name) continue;
       const bone = this.skeleton.getBone(name);
       if (!bone) continue;
-      bone.getWorldPosition(mesh.position);
-      // gizmoSize is a 3-4 range for body bones and ~1 for fingers, which is
-      // the wrong order of magnitude for a sphere radius, so it is scaled and
-      // clamped rather than used directly.
+      bone.getWorldPosition(worldPosition);
+      mesh.position.copy(this.group.worldToLocal(worldPosition));
+      const childBones = bone.children.filter(
+        (candidate): candidate is THREE.Bone => candidate instanceof THREE.Bone,
+      );
+      let boneLength = 0;
+      if (childBones.length > 0) {
+        for (const childBone of childBones) {
+          childBone.getWorldPosition(childPosition);
+          boneLength += worldPosition.distanceTo(childPosition);
+        }
+        boneLength /= childBones.length;
+      } else if (bone.parent instanceof THREE.Bone) {
+        bone.parent.getWorldPosition(childPosition);
+        boneLength = worldPosition.distanceTo(childPosition);
+      }
+      // Scale each marker to its bone segment, retaining per-model tuning.
       const radius = THREE.MathUtils.clamp(
-        this.skeleton.gizmoSize(name) * 0.035,
+        boneLength * (this.skeleton.gizmoSize(name) / 3) * 0.18,
         MIN_RADIUS,
         MAX_RADIUS,
       );
@@ -183,10 +225,18 @@ export class JointHandles {
     for (const child of [...this.group.children]) this.group.remove(child);
   }
 
+  private materialForBone(name: string): THREE.MeshBasicMaterial {
+    const side = name.toLowerCase();
+    if (side.includes("hip")) return this.materials.hips;
+    if (side.includes("left")) return this.materials.left;
+    if (side.includes("right")) return this.materials.right;
+    return this.materials.center;
+  }
+
   dispose(): void {
     this.clear();
     this.geometry.dispose();
-    this.material.dispose();
+    for (const material of Object.values(this.materials)) material.dispose();
     this.skeleton = null;
   }
 }

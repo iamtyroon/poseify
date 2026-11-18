@@ -13,12 +13,10 @@ export type BoneRotation = [number, number, number, number];
 /**
  * Where a pose came from.
  *
- * "generated" is separate from "authored" on purpose: a generated pose is
- * computed by tools/generate-poses.ts and validated, but an artist filtering
- * the picker may reasonably want to see the hand-written poses first, and the
- * distinction has to survive a save/load round-trip.
+ * "authored" is the built-in pose library. Other values identify imported,
+ * clip-derived, or user-created poses.
  */
-export type PoseSource = "authored" | "generated" | "clip" | "imported" | "user";
+export type PoseSource = "authored" | "clip" | "imported" | "user";
 
 export interface Pose {
   // Stable id, unique within the library.

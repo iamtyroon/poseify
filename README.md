@@ -138,7 +138,6 @@ Open the URL Vite prints, usually <http://localhost:5173>.
 | `npm run models:fetch` | Download the model FBX files only |
 | `npm run models:verify` | Check every model against the rig contract |
 | `npm run clips:build` | Download and convert the mocap clips only |
-| `npm run poses:generate` | Rebuild the generated pose library (10,368 combinations) |
 | `npm run scenes:generate` | Rebuild the generated scene library (19,404 compositions) |
 
 ## How it works

@@ -17,7 +17,6 @@
     "models:fetch": "vite-node tools/fetch-models.ts",
     "models:verify": "vite-node tools/verify-models.ts",
     "clips:build": "vite-node tools/build-clips.ts",
-    "poses:generate": "vite-node tools/build-pose-library.ts",
     "scenes:generate": "vite-node tools/build-scene-library.ts",
     "demo:build": "vite-node tools/build-demo.ts"
   },

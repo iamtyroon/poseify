@@ -84,10 +84,16 @@ export class ObjectController {
 
   private readonly gizmo: TransformControls;
   private readonly gizmoHelper: THREE.Object3D;
+  private readonly helperRoot = new THREE.Group();
+  private readonly pivot = new THREE.Object3D();
   private readonly camera: THREE.Camera;
   private readonly orbit: OrbitControls;
   private target: THREE.Object3D | null = null;
   private isDragging = false;
+  private readonly centerOffset = new THREE.Vector3();
+  private readonly lastPosition = new THREE.Vector3();
+  private readonly lastQuaternion = new THREE.Quaternion();
+  private readonly lastScale = new THREE.Vector3(1, 1, 1);
 
   constructor(
     domElement: HTMLElement,
@@ -103,20 +109,28 @@ export class ObjectController {
     this.gizmo.size = 0.9;
     this.gizmoHelper = this.gizmo.getHelper();
     this.gizmoHelper.visible = false;
+    this.helperRoot.add(this.pivot, this.gizmoHelper);
+    this.gizmo.attach(this.pivot);
+    this.gizmoHelper.visible = false;
 
     this.gizmo.addEventListener("dragging-changed", (event) => {
       const dragging = (event as unknown as { value: boolean }).value;
       this.isDragging = dragging;
       // Orbit must yield while the gizmo is dragged or the camera fights it.
       this.orbit.enabled = !dragging;
+      if (!dragging) {
+        this.pivot.scale.set(1, 1, 1);
+        this.lastScale.set(1, 1, 1);
+      }
     });
     this.gizmo.addEventListener("objectChange", () => {
+      this.applyPivotTransform();
       this.onChange?.();
     });
   }
 
   get helper(): THREE.Object3D {
-    return this.gizmoHelper;
+    return this.helperRoot;
   }
 
   get attached(): THREE.Object3D | null {
@@ -131,6 +145,8 @@ export class ObjectController {
   setMode(mode: ObjectGizmoMode): void {
     this.mode = mode;
     this.gizmo.setMode(mode);
+    this.pivot.scale.set(1, 1, 1);
+    this.lastScale.set(1, 1, 1);
   }
 
   /**
@@ -139,14 +155,61 @@ export class ObjectController {
    */
   attach(object: THREE.Object3D | null): void {
     this.target = null;
-    this.gizmo.detach();
     this.gizmoHelper.visible = false;
     if (object && !isLocked(object)) {
       this.target = object;
-      this.gizmo.attach(object);
+      object.updateWorldMatrix(true, true);
+      const bounds = new THREE.Box3().setFromObject(object);
+      const center = bounds.isEmpty()
+        ? object.getWorldPosition(new THREE.Vector3())
+        : bounds.getCenter(new THREE.Vector3());
+      this.centerOffset.copy(object.worldToLocal(center.clone()));
+      this.pivot.position.copy(center);
+      this.pivot.quaternion.copy(object.getWorldQuaternion(new THREE.Quaternion()));
+      this.pivot.scale.set(1, 1, 1);
+      this.lastPosition.copy(this.pivot.position);
+      this.lastQuaternion.copy(this.pivot.quaternion);
+      this.lastScale.set(1, 1, 1);
+      this.gizmo.attach(this.pivot);
       this.gizmoHelper.visible = true;
+    } else {
+      this.gizmo.detach();
     }
     this.onSelect?.(this.target);
+  }
+
+  /** Apply gizmo deltas to the real object while keeping pivot at its center. */
+  private applyPivotTransform(): void {
+    if (!this.target) return;
+    if (this.mode === "translate") {
+      this.target.position.add(
+        new THREE.Vector3().subVectors(this.pivot.position, this.lastPosition),
+      );
+    } else if (this.mode === "rotate") {
+      const delta = this.pivot.quaternion
+        .clone()
+        .multiply(this.lastQuaternion.clone().invert());
+      this.target.position
+        .sub(this.lastPosition)
+        .applyQuaternion(delta)
+        .add(this.lastPosition);
+      this.target.quaternion.premultiply(delta);
+    } else {
+      const ratio = new THREE.Vector3(
+        this.pivot.scale.x / this.lastScale.x,
+        this.pivot.scale.y / this.lastScale.y,
+        this.pivot.scale.z / this.lastScale.z,
+      );
+      this.target.scale.multiply(ratio);
+      this.target.position.sub(this.lastPosition).multiply(ratio).add(this.lastPosition);
+    }
+
+    this.target.updateWorldMatrix(true, true);
+    this.pivot.position.copy(this.target.localToWorld(this.centerOffset.clone()));
+    this.pivot.quaternion.copy(this.target.getWorldQuaternion(new THREE.Quaternion()));
+    this.lastPosition.copy(this.pivot.position);
+    this.lastQuaternion.copy(this.pivot.quaternion);
+    this.lastScale.copy(this.pivot.scale);
   }
 
   /** Release without firing onSelect, for teardown paths. */
